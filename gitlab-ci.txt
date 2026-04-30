@@ -4,20 +4,32 @@
 # Rules:
 #   - Any change to a file named 'values.yml' (anywhere)
 #   - Any change to a file matching '*-prod.yml' (anywhere)
-#   → Only project OWNERs may merge to main
+#   → Pipeline fails, blocking merge for everyone
 #
-#   - All other changes → Maintainers/Developers may merge
+#   - All other changes → Pipeline passes, merge open to
+#     Developers + Maintainers
+#
+# Post-merge:
+#   - Auto-tags main with a UTC datetime stamp on every
+#     successful merge
 # ============================================================
 
 stages:
   - validate
+  - tag
 
 variables:
   TARGET_BRANCH: "main"
+  GITLAB_URL: "https://gitlab.com"  # Change to your GitLab instance URL
 
 .mr_only: &mr_only
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# ============================================================
+# VALIDATE STAGE
+# Runs on every MR — blocks merge if sensitive files changed
+# ============================================================
 
 check-sensitive-files:
   stage: validate
@@ -30,7 +42,6 @@ check-sensitive-files:
       echo "=== Checking changed files in MR: $CI_MERGE_REQUEST_IID ==="
       echo "Source: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME -> Target: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
 
-      # Fetch both branches so we can diff them
       git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
       git fetch origin "$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
 
@@ -40,7 +51,6 @@ check-sensitive-files:
 
       echo "Merge base: $BASE_SHA"
 
-      # Get all changed files (added, modified, deleted, renamed — everything)
       CHANGED_FILES=$(git diff --name-only --diff-filter=ACDMRT "$BASE_SHA" "origin/$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME")
 
       echo "--- Changed files ---"
@@ -54,14 +64,12 @@ check-sensitive-files:
 
         BASENAME=$(basename "$file")
 
-        # Match exact filename 'values.yml'
         if [ "$BASENAME" = "values.yml" ]; then
           echo "SENSITIVE MATCH (values.yml): $file"
           SENSITIVE=true
           break
         fi
 
-        # Match *-prod.yml pattern
         case "$BASENAME" in
           *-prod.yml)
             echo "SENSITIVE MATCH (*-prod.yml): $file"
@@ -76,26 +84,56 @@ check-sensitive-files:
         echo "============================================================"
         echo "  OWNER-ONLY MERGE REQUIRED"
         echo "  This MR contains changes to sensitive files (values.yml"
-        echo "  or *-prod.yml). Only project OWNERs may merge this MR."
+        echo "  or *-prod.yml). Contact a project Owner to merge this MR."
         echo "============================================================"
-        echo ""
-        # Write a flag artifact for downstream jobs / external enforcement
-        echo "OWNER_REQUIRED=true" > merge_gate.env
-        # Fail the pipeline — prevents accidental merge via CI bypass
-        # Remove the exit 1 below if you rely solely on protected branch
-        # rules / approval settings and want the pipeline to stay green.
         exit 1
       else
         echo ""
         echo "============================================================"
-        echo "  STANDARD MERGE: Maintainers and Developers may merge."
+        echo "  STANDARD MERGE: Developers and Maintainers may merge."
         echo "============================================================"
-        echo ""
-        echo "OWNER_REQUIRED=false" > merge_gate.env
         exit 0
       fi
-  artifacts:
-    reports:
-      dotenv: merge_gate.env
-    when: always
-    expire_in: 1 day
+
+# ============================================================
+# TAG STAGE
+# Runs ONLY when a merge commit lands on main via a push
+# (i.e. a completed merge request) — never on MR pipelines
+# ============================================================
+
+create-merge-tag:
+  stage: tag
+  image: alpine:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_MESSAGE =~ /^Merge branch/'
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      TAG_NAME="release-$(date -u +%Y%m%d-%H%M%S)"
+
+      echo "=== Creating post-merge tag ==="
+      echo "Tag:    $TAG_NAME"
+      echo "Commit: $CI_COMMIT_SHA"
+      echo "Author: $CI_COMMIT_AUTHOR"
+      echo "MR:     $CI_MERGE_REQUEST_IID"
+
+      HTTP_STATUS=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+        --request POST \
+        --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "{
+          \"tag_name\": \"$TAG_NAME\",
+          \"ref\": \"$CI_COMMIT_SHA\",
+          \"message\": \"Auto-tagged after merge to main\nCommit: $CI_COMMIT_SHA\nAuthor: $CI_COMMIT_AUTHOR\"
+        }" \
+        "$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/repository/tags")
+
+      echo "API response status: $HTTP_STATUS"
+
+      if [ "$HTTP_STATUS" = "201" ]; then
+        echo "Tag $TAG_NAME created successfully."
+      else
+        echo "ERROR: Tag creation failed with HTTP $HTTP_STATUS"
+        exit 1
+      fi
