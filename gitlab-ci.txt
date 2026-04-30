@@ -1,67 +1,9 @@
-# ============================================================
-# Merge Request Gate: Protect sensitive file changes
-#
-# REQUIREMENTS
-# ============================================================
-#
-# GitLab Project Settings:
-#
-#   Settings → Repository → Protected Branches (main)
-#     - Allowed to merge: Developers + Maintainers
-#     - Allowed to push:  No one
-#
-#   Settings → General → Merge Requests → Merge checks
-#     - Pipelines must succeed: ENABLED
-#
-# CI Variable:
-#
-#   Settings → CI/CD → Variables
-#     - Key:             GITLAB_API_TOKEN
-#     - Role required:   Reporter (minimum)
-#     - Scope required:  api
-#     - Protect:         true
-#     - Mask:            true
-#
-#   Note: If release-* tags are protected, the token role must
-#   meet the "Allowed to create" setting on those tag rules.
-#
-# ============================================================
-# Logic:
-#
-#   MR contains values.yml or *-prod.yml changes
-#     → Pipeline fails, merge blocked for everyone
-#
-#   MR contains no sensitive files
-#     → Pipeline passes, Developers + Maintainers may merge
-#
-#   Successful merge to main
-#     → Auto-tag created with UTC datetime (release-YYYYMMDD-HHMMSS)
-#
-# ============================================================
-
-stages:
-  - validate
-  - tag
-
-variables:
-  TARGET_BRANCH: "main"
-  GITLAB_URL: "https://gitlab.com"  # Change to your GitLab instance URL
-
-.mr_only: &mr_only
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-
-# ============================================================
-# VALIDATE STAGE
-# Runs on every MR — blocks merge if sensitive files changed
-# ============================================================
-
 check-sensitive-files:
   stage: validate
   <<: *mr_only
   image: alpine:latest
   before_script:
-    - apk add --no-cache git
+    - apk add --no-cache git curl
   script:
     - |
       echo "=== Checking changed files in MR: $CI_MERGE_REQUEST_IID ==="
@@ -104,61 +46,51 @@ check-sensitive-files:
         esac
       done <<< "$CHANGED_FILES"
 
-      if [ "$SENSITIVE" = "true" ]; then
+      if [ "$SENSITIVE" = "false" ]; then
         echo ""
         echo "============================================================"
-        echo "  OWNER-ONLY MERGE REQUIRED"
-        echo "  This MR contains changes to sensitive files (values.yml"
-        echo "  or *-prod.yml). Contact a project Owner to merge this MR."
-        echo "============================================================"
-        exit 1
-      else
-        echo ""
-        echo "============================================================"
-        echo "  STANDARD MERGE: Developers and Maintainers may merge."
+        echo "  NO SENSITIVE FILES CHANGED"
+        echo "  Developers and Maintainers may merge."
         echo "============================================================"
         exit 0
       fi
 
-# ============================================================
-# TAG STAGE
-# Runs ONLY when a merge commit lands on main via a push
-# (i.e. a completed merge request) — never on MR pipelines
-# ============================================================
+      # Sensitive files detected — check if MR author is an Owner
+      echo ""
+      echo "Sensitive files detected. Checking if MR author '$CI_MERGE_REQUEST_AUTHOR_USERNAME' is a project Owner..."
 
-create-merge-tag:
-  stage: tag
-  image: alpine:latest
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_MESSAGE =~ /^Merge branch/'
-  before_script:
-    - apk add --no-cache curl
-  script:
-    - |
-      TAG_NAME="release-$(date -u +%Y%m%d-%H%M%S)"
-
-      echo "=== Creating post-merge tag ==="
-      echo "Tag:    $TAG_NAME"
-      echo "Commit: $CI_COMMIT_SHA"
-      echo "Author: $CI_COMMIT_AUTHOR"
-      echo "MR:     $CI_MERGE_REQUEST_IID"
-
-      HTTP_STATUS=$(curl --silent --output /dev/null --write-out "%{http_code}" \
-        --request POST \
+      HTTP_STATUS=$(curl --silent --write-out "%{http_code}" --output /tmp/member.json \
         --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
-        --header "Content-Type: application/json" \
-        --data "{
-          \"tag_name\": \"$TAG_NAME\",
-          \"ref\": \"$CI_COMMIT_SHA\",
-          \"message\": \"Auto-tagged after merge to main\nCommit: $CI_COMMIT_SHA\nAuthor: $CI_COMMIT_AUTHOR\"
-        }" \
-        "$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/repository/tags")
+        "$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/members/all/$CI_MERGE_REQUEST_AUTHOR_ID")
 
       echo "API response status: $HTTP_STATUS"
 
-      if [ "$HTTP_STATUS" = "201" ]; then
-        echo "Tag $TAG_NAME created successfully."
+      if [ "$HTTP_STATUS" != "200" ]; then
+        echo "ERROR: Could not retrieve membership info for user ID $CI_MERGE_REQUEST_AUTHOR_ID (HTTP $HTTP_STATUS)"
+        exit 1
+      fi
+
+      cat /tmp/member.json
+
+      # GitLab access levels:
+      # 50 = Owner, 40 = Maintainer, 30 = Developer, 20 = Reporter, 10 = Guest
+      ACCESS_LEVEL=$(cat /tmp/member.json | grep -o '"access_level":[0-9]*' | head -1 | grep -o '[0-9]*')
+
+      echo "Author access level: $ACCESS_LEVEL"
+
+      if [ "$ACCESS_LEVEL" = "50" ]; then
+        echo ""
+        echo "============================================================"
+        echo "  SENSITIVE FILES CHANGED — AUTHOR IS OWNER"
+        echo "  Pipeline passing. Owner approval satisfied."
+        echo "============================================================"
+        exit 0
       else
-        echo "ERROR: Tag creation failed with HTTP $HTTP_STATUS"
+        echo ""
+        echo "============================================================"
+        echo "  SENSITIVE FILES CHANGED — AUTHOR IS NOT AN OWNER"
+        echo "  Pipeline blocked. An Owner must create or approve this MR."
+        echo "  Contact a project Owner to action this change."
+        echo "============================================================"
         exit 1
       fi
