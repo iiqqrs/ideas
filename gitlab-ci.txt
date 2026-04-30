@@ -1,17 +1,42 @@
 # ============================================================
 # Merge Request Gate: Protect sensitive file changes
 #
-# Rules:
-#   - Any change to a file named 'values.yml' (anywhere)
-#   - Any change to a file matching '*-prod.yml' (anywhere)
-#   → Pipeline fails, blocking merge for everyone
+# REQUIREMENTS
+# ============================================================
 #
-#   - All other changes → Pipeline passes, merge open to
-#     Developers + Maintainers
+# GitLab Project Settings:
 #
-# Post-merge:
-#   - Auto-tags main with a UTC datetime stamp on every
-#     successful merge
+#   Settings → Repository → Protected Branches (main)
+#     - Allowed to merge: Developers + Maintainers
+#     - Allowed to push:  No one
+#
+#   Settings → General → Merge Requests → Merge checks
+#     - Pipelines must succeed: ENABLED
+#
+# CI Variable:
+#
+#   Settings → CI/CD → Variables
+#     - Key:             GITLAB_API_TOKEN
+#     - Role required:   Reporter (minimum)
+#     - Scope required:  api
+#     - Protect:         true
+#     - Mask:            true
+#
+#   Note: If release-* tags are protected, the token role must
+#   meet the "Allowed to create" setting on those tag rules.
+#
+# ============================================================
+# Logic:
+#
+#   MR contains values.yml or *-prod.yml changes
+#     → Pipeline fails, merge blocked for everyone
+#
+#   MR contains no sensitive files
+#     → Pipeline passes, Developers + Maintainers may merge
+#
+#   Successful merge to main
+#     → Auto-tag created with UTC datetime (release-YYYYMMDD-HHMMSS)
+#
 # ============================================================
 
 stages:
