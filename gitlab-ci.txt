@@ -19,31 +19,256 @@
 #     - Key:             GITLAB_API_TOKEN
 #     - Role required:   Reporter (minimum)
 #     - Scope required:  api
-#     - Protect:         true
+#     - Protect:         false  (must be available on all branches)
 #     - Mask:            true
 #
 #   Note: If release-* tags are protected, the token role must
 #   meet the "Allowed to create" setting on those tag rules.
-#
-# ============================================================
-# Logic:
-#
-#   MR contains values.yml or *-prod.yml changes
-#     AND MR author is a project Owner
-#     → Pipeline passes, merge allowed
-#
-#   MR contains values.yml or *-prod.yml changes
-#     AND MR author is NOT a project Owner
-#     → Pipeline fails, merge blocked for everyone
-#
-#   MR contains no sensitive files
-#     → Pipeline passes, Developers + Maintainers may merge
-#
-#   Successful merge to main
-#     → Auto-tag created with UTC datetime (release-YYYYMMDD-HHMMSS)
 #
 #   Note: CI_MERGE_REQUEST_AUTHOR_ID requires GitLab 15.3+
 #         On older versions a secondary API call is needed
 #         to resolve author ID from username.
 #
 # ============================================================
+# Logic:
+#
+#   MR contains no sensitive files (values.yml / *-prod.yml)
+#     → Pipeline passes
+#     → Developers + Maintainers may merge
+#
+#   MR contains sensitive files AND author is an Owner
+#     → Pipeline passes
+#     → Developers + Maintainers may merge
+#
+#   MR contains sensitive files AND author is NOT an Owner
+#   AND an Owner has approved the MR
+#     → Pipeline passes once job is retried after approval
+#     → Developers + Maintainers may merge
+#
+#   MR contains sensitive files AND author is NOT an Owner
+#   AND no Owner approval exists
+#     → Pipeline fails, merge blocked for everyone
+#     → Owner must approve, then job must be retried
+#
+#   Successful merge to main
+#     → Auto-tag created with UTC datetime (release-YYYYMMDD-HHMMSS)
+#
+# ============================================================
+
+stages:
+  - validate
+  - tag
+
+variables:
+  TARGET_BRANCH: "main"
+  GITLAB_URL: "https://gitlab.com"  # Change to your GitLab instance URL
+
+.mr_only: &mr_only
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# ============================================================
+# VALIDATE STAGE
+# Runs on every MR.
+#
+# Pass conditions:
+#   - No sensitive files changed
+#   - Sensitive files changed AND author is Owner
+#   - Sensitive files changed AND an Owner has approved the MR
+#
+# Fail conditions:
+#   - Sensitive files changed, author is not Owner, no Owner approval
+#
+# Retry this job after an Owner approves to unlock the pipeline.
+# ============================================================
+
+check-sensitive-files:
+  stage: validate
+  <<: *mr_only
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache git curl
+  script:
+    - |
+      echo "=== Checking changed files in MR: $CI_MERGE_REQUEST_IID ==="
+      echo "Source: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME -> Target: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+
+      git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+      git fetch origin "$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
+
+      BASE_SHA=$(git merge-base \
+        "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" \
+        "origin/$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME")
+
+      echo "Merge base: $BASE_SHA"
+
+      CHANGED_FILES=$(git diff --name-only --diff-filter=ACDMRT "$BASE_SHA" "origin/$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME")
+
+      echo "--- Changed files ---"
+      echo "$CHANGED_FILES"
+      echo "---------------------"
+
+      SENSITIVE=false
+
+      while IFS= read -r file; do
+        [ -z "$file" ] && continue
+
+        BASENAME=$(basename "$file")
+
+        if [ "$BASENAME" = "values.yml" ]; then
+          echo "SENSITIVE MATCH (values.yml): $file"
+          SENSITIVE=true
+          break
+        fi
+
+        case "$BASENAME" in
+          *-prod.yml)
+            echo "SENSITIVE MATCH (*-prod.yml): $file"
+            SENSITIVE=true
+            break
+            ;;
+        esac
+      done <<< "$CHANGED_FILES"
+
+      if [ "$SENSITIVE" = "false" ]; then
+        echo ""
+        echo "============================================================"
+        echo "  NO SENSITIVE FILES CHANGED"
+        echo "  Developers and Maintainers may merge."
+        echo "============================================================"
+        exit 0
+      fi
+
+      echo ""
+      echo "Sensitive files detected. Checking author and approvals..."
+
+      # ── Check if MR author is an Owner ──────────────────────────────
+      HTTP_STATUS=$(curl --silent --write-out "%{http_code}" --output /tmp/author.json \
+        --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+        "$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/members/all/$CI_MERGE_REQUEST_AUTHOR_ID")
+
+      echo "Author membership API status: $HTTP_STATUS"
+
+      if [ "$HTTP_STATUS" != "200" ]; then
+        echo "ERROR: Could not retrieve author membership (HTTP $HTTP_STATUS)"
+        exit 1
+      fi
+
+      AUTHOR_USERNAME=$(cat /tmp/author.json | grep -o '"username":"[^"]*"' | head -1 | cut -d'"' -f4)
+      AUTHOR_ACCESS=$(cat /tmp/author.json | grep -o '"access_level":[0-9]*' | head -1 | grep -o '[0-9]*')
+
+      echo "Author: $AUTHOR_USERNAME | Access level: $AUTHOR_ACCESS"
+
+      # GitLab access levels: 50=Owner 40=Maintainer 30=Developer 20=Reporter 10=Guest
+      if [ "$AUTHOR_ACCESS" = "50" ]; then
+        echo ""
+        echo "============================================================"
+        echo "  SENSITIVE FILES CHANGED — AUTHOR IS OWNER"
+        echo "  Pipeline passing. Owner authorship satisfied."
+        echo "============================================================"
+        exit 0
+      fi
+
+      # ── Author is not an Owner — check for Owner approval ───────────
+      echo "Author is not an Owner. Checking MR approvals..."
+
+      HTTP_STATUS=$(curl --silent --write-out "%{http_code}" --output /tmp/approvals.json \
+        --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+        "$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/approvals")
+
+      echo "Approvals API status: $HTTP_STATUS"
+
+      if [ "$HTTP_STATUS" != "200" ]; then
+        echo "ERROR: Could not retrieve MR approvals (HTTP $HTTP_STATUS)"
+        exit 1
+      fi
+
+      echo "--- Approvals response ---"
+      cat /tmp/approvals.json
+      echo ""
+      echo "--------------------------"
+
+      # Extract approved_by user IDs and check each against member API
+      APPROVED_BY_IDS=$(cat /tmp/approvals.json | grep -o '"id":[0-9]*' | grep -o '[0-9]*')
+
+      OWNER_APPROVED=false
+
+      for USER_ID in $APPROVED_BY_IDS; do
+        MEMBER_STATUS=$(curl --silent --write-out "%{http_code}" --output /tmp/approver.json \
+          --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+          "$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/members/all/$USER_ID")
+
+        if [ "$MEMBER_STATUS" != "200" ]; then
+          continue
+        fi
+
+        APPROVER_USERNAME=$(cat /tmp/approver.json | grep -o '"username":"[^"]*"' | head -1 | cut -d'"' -f4)
+        APPROVER_ACCESS=$(cat /tmp/approver.json | grep -o '"access_level":[0-9]*' | head -1 | grep -o '[0-9]*')
+
+        echo "Approver: $APPROVER_USERNAME | Access level: $APPROVER_ACCESS"
+
+        if [ "$APPROVER_ACCESS" = "50" ]; then
+          echo "Owner approval found: $APPROVER_USERNAME"
+          OWNER_APPROVED=true
+          break
+        fi
+      done
+
+      if [ "$OWNER_APPROVED" = "true" ]; then
+        echo ""
+        echo "============================================================"
+        echo "  SENSITIVE FILES CHANGED — OWNER APPROVAL PRESENT"
+        echo "  Pipeline passing. Developers and Maintainers may merge."
+        echo "============================================================"
+        exit 0
+      else
+        echo ""
+        echo "============================================================"
+        echo "  SENSITIVE FILES CHANGED — NO OWNER APPROVAL"
+        echo "  An Owner must approve this MR before it can be merged."
+        echo "  Once approved, retry this job to unlock the pipeline."
+        echo "============================================================"
+        exit 1
+      fi
+
+# ============================================================
+# TAG STAGE
+# Runs ONLY when a merge commit lands on main via a push
+# (i.e. a completed merge request) — never on MR pipelines
+# ============================================================
+
+create-merge-tag:
+  stage: tag
+  image: alpine:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_MESSAGE =~ /^Merge branch/'
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      TAG_NAME="release-$(date -u +%Y%m%d-%H%M%S)"
+
+      echo "=== Creating post-merge tag ==="
+      echo "Tag:    $TAG_NAME"
+      echo "Commit: $CI_COMMIT_SHA"
+      echo "Author: $CI_COMMIT_AUTHOR"
+
+      HTTP_STATUS=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+        --request POST \
+        --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "{
+          \"tag_name\": \"$TAG_NAME\",
+          \"ref\": \"$CI_COMMIT_SHA\",
+          \"message\": \"Auto-tagged after merge to main\nCommit: $CI_COMMIT_SHA\nAuthor: $CI_COMMIT_AUTHOR\"
+        }" \
+        "$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/repository/tags")
+
+      echo "API response status: $HTTP_STATUS"
+
+      if [ "$HTTP_STATUS" = "201" ]; then
+        echo "Tag $TAG_NAME created successfully."
+      else
+        echo "ERROR: Tag creation failed with HTTP $HTTP_STATUS"
+        exit 1
+      fi
