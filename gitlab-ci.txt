@@ -1,3 +1,262 @@
+# ============================================================
+# Merge Request Gate: Protect sensitive file changes
+#
+# REQUIREMENTS
+# ============================================================
+#
+# GitLab Project Settings:
+#
+#   Settings → Repository → Protected Branches (main)
+#     - Allowed to merge:          Developers + Maintainers
+#     - Allowed to push and merge: No one
+#       (forces all changes through a Merge Request)
+#
+#   Settings → Repository → Protected Tags
+#     - Tag:               release-*
+#     - Allowed to create: Developers + Maintainers
+#     - Note: Deletion of protected tags is always Owner-only
+#             regardless of the above setting
+#
+#   Settings → General → Merge Requests → Merge checks
+#     - Pipelines must succeed: ENABLED
+#
+# CI Variable:
+#
+#   Settings → CI/CD → Variables
+#     - Key:             GITLAB_API_TOKEN
+#     - Role required:   Developer (minimum — sufficient for
+#                        protected tag creation and API calls)
+#     - Scope required:  api
+#     - Protect:         false  (must be available on all branches)
+#     - Mask:            true
+#
+# ============================================================
+# Logic:
+#
+#   MR contains no sensitive files (values.yml / *-prod.yml)
+#     → Pipeline passes
+#     → Developers + Maintainers may merge
+#
+#   MR contains sensitive files AND author is an Owner
+#     → Pipeline passes
+#     → Developers + Maintainers may merge
+#
+#   MR contains sensitive files AND author is NOT an Owner
+#   AND an Owner has approved the MR
+#     → Pipeline passes once job is retried after approval
+#     → Developers + Maintainers may merge
+#
+#   MR contains sensitive files AND author is NOT an Owner
+#   AND no Owner approval exists
+#     → Pipeline fails, merge blocked for everyone
+#     → Owner must approve, then job must be retried
+#
+#   Successful merge to main containing sensitive files
+#     → Auto-tag created with UTC datetime (release-YYYYMMDD-HHMMSS)
+#     → Tag protected by release-* wildcard rule (Owner-only delete)
+#
+#   Successful merge to main with no sensitive files
+#     → No tag created
+#
+# ============================================================
+
+stages:
+  - validate
+  - tag
+
+variables:
+  TARGET_BRANCH: "main"
+  GITLAB_URL: "https://gitlab.com"  # Change to your GitLab instance URL
+
+.mr_only: &mr_only
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# ============================================================
+# VALIDATE STAGE
+# Runs on every MR.
+#
+# Pass conditions:
+#   - No sensitive files changed
+#   - Sensitive files changed AND author is Owner
+#   - Sensitive files changed AND an Owner has approved the MR
+#
+# Fail conditions:
+#   - Sensitive files changed, author is not Owner, no Owner approval
+#
+# Retry this job after an Owner approves to unlock the pipeline.
+# ============================================================
+
+check-sensitive-files:
+  stage: validate
+  <<: *mr_only
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache git curl jq
+  script:
+    - |
+      echo "=== Checking changed files in MR: $CI_MERGE_REQUEST_IID ==="
+      echo "Source: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME -> Target: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+
+      git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+      git fetch origin "$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
+
+      BASE_SHA=$(git merge-base \
+        "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" \
+        "origin/$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME")
+
+      echo "Merge base: $BASE_SHA"
+
+      CHANGED_FILES=$(git diff --name-only --diff-filter=ACDMRT "$BASE_SHA" "origin/$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME")
+
+      echo "--- Changed files ---"
+      echo "$CHANGED_FILES"
+      echo "---------------------"
+
+      SENSITIVE=false
+
+      while IFS= read -r file; do
+        [ -z "$file" ] && continue
+
+        BASENAME=$(basename "$file")
+
+        if [ "$BASENAME" = "values.yml" ]; then
+          echo "SENSITIVE MATCH (values.yml): $file"
+          SENSITIVE=true
+          break
+        fi
+
+        case "$BASENAME" in
+          *-prod.yml)
+            echo "SENSITIVE MATCH (*-prod.yml): $file"
+            SENSITIVE=true
+            break
+            ;;
+        esac
+      done <<< "$CHANGED_FILES"
+
+      if [ "$SENSITIVE" = "false" ]; then
+        echo ""
+        echo "============================================================"
+        echo "  NO SENSITIVE FILES CHANGED"
+        echo "  Developers and Maintainers may merge."
+        echo "============================================================"
+        exit 0
+      fi
+
+      echo ""
+      echo "Sensitive files detected. Checking MR author..."
+
+      # ── Resolve MR author from MR API ───────────────────────────────
+      HTTP_STATUS=$(curl --silent --write-out "%{http_code}" --output /tmp/mr.json \
+        --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+        "$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID")
+
+      echo "MR API status: $HTTP_STATUS"
+
+      if [ "$HTTP_STATUS" != "200" ]; then
+        echo "ERROR: Could not retrieve MR info (HTTP $HTTP_STATUS)"
+        exit 1
+      fi
+
+      AUTHOR_USERNAME=$(jq -r '.author.username' /tmp/mr.json)
+      AUTHOR_NAME=$(jq -r '.author.name' /tmp/mr.json)
+      AUTHOR_ID=$(jq -r '.author.id' /tmp/mr.json)
+
+      echo "MR Author: $AUTHOR_NAME ($AUTHOR_USERNAME) | ID: $AUTHOR_ID"
+
+      # ── Check author membership level ────────────────────────────────
+      HTTP_STATUS=$(curl --silent --write-out "%{http_code}" --output /tmp/author.json \
+        --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+        "$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/members/all/$AUTHOR_ID")
+
+      echo "Author membership API status: $HTTP_STATUS"
+
+      if [ "$HTTP_STATUS" != "200" ]; then
+        echo "ERROR: Could not retrieve author membership (HTTP $HTTP_STATUS)"
+        exit 1
+      fi
+
+      AUTHOR_ACCESS=$(jq -r '.access_level' /tmp/author.json)
+
+      echo "Author: $AUTHOR_NAME | Access level: $AUTHOR_ACCESS"
+
+      # GitLab access levels: 50=Owner 40=Maintainer 30=Developer 20=Reporter 10=Guest
+      if [ "$AUTHOR_ACCESS" = "50" ]; then
+        echo ""
+        echo "============================================================"
+        echo "  SENSITIVE FILES CHANGED — AUTHOR IS OWNER"
+        echo "  Pipeline passing. Owner authorship satisfied."
+        echo "============================================================"
+        exit 0
+      fi
+
+      # ── Author is not an Owner — check for Owner approval ───────────
+      echo "Author is not an Owner. Checking MR approvals..."
+
+      HTTP_STATUS=$(curl --silent --write-out "%{http_code}" --output /tmp/approvals.json \
+        --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+        "$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/approvals")
+
+      echo "Approvals API status: $HTTP_STATUS"
+
+      if [ "$HTTP_STATUS" != "200" ]; then
+        echo "ERROR: Could not retrieve MR approvals (HTTP $HTTP_STATUS)"
+        exit 1
+      fi
+
+      APPROVED_BY_IDS=$(jq -r '.approved_by[].user.id' /tmp/approvals.json)
+
+      echo "Approved by IDs: $APPROVED_BY_IDS"
+
+      OWNER_APPROVED=false
+
+      for USER_ID in $APPROVED_BY_IDS; do
+        MEMBER_STATUS=$(curl --silent --write-out "%{http_code}" --output /tmp/approver.json \
+          --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+          "$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/members/all/$USER_ID")
+
+        if [ "$MEMBER_STATUS" != "200" ]; then
+          continue
+        fi
+
+        APPROVER_USERNAME=$(jq -r '.username' /tmp/approver.json)
+        APPROVER_ACCESS=$(jq -r '.access_level' /tmp/approver.json)
+
+        echo "Approver: $APPROVER_USERNAME | Access level: $APPROVER_ACCESS"
+
+        if [ "$APPROVER_ACCESS" = "50" ]; then
+          echo "Owner approval found: $APPROVER_USERNAME"
+          OWNER_APPROVED=true
+          break
+        fi
+      done
+
+      if [ "$OWNER_APPROVED" = "true" ]; then
+        echo ""
+        echo "============================================================"
+        echo "  SENSITIVE FILES CHANGED — OWNER APPROVAL PRESENT"
+        echo "  Pipeline passing. Developers and Maintainers may merge."
+        echo "============================================================"
+        exit 0
+      else
+        echo ""
+        echo "============================================================"
+        echo "  SENSITIVE FILES CHANGED — NO OWNER APPROVAL"
+        echo "  An Owner must approve this MR before it can be merged."
+        echo "  Once approved, retry this job to unlock the pipeline."
+        echo "============================================================"
+        exit 1
+      fi
+
+# ============================================================
+# TAG STAGE
+# Runs ONLY when a merge commit lands on main via a push
+# (i.e. a completed merge request) — never on MR pipelines.
+# Re-detects sensitive files from the merge commit diff so it
+# is fully self-contained with no dependency on the MR pipeline.
+# ============================================================
+
 create-merge-tag:
   stage: tag
   image: alpine:latest
