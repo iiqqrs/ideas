@@ -1,5 +1,68 @@
-#   Settings → Repository → Protected Tags
-#     - Tag:              release-*
-#     - Allowed to create: Developers + Maintainers
-#     - Note: Deletion of protected tags is always Owner-only
-#             regardless of the above setting
+create-merge-tag:
+  stage: tag
+  image: alpine:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_MESSAGE =~ /^Merge branch/'
+  before_script:
+    - apk add --no-cache git curl
+  script:
+    - |
+      echo "=== Checking if merge contained sensitive files ==="
+
+      git fetch --unshallow 2>/dev/null || true
+      CHANGED_FILES=$(git diff --name-only HEAD^1 HEAD)
+
+      echo "--- Changed files in merge commit ---"
+      echo "$CHANGED_FILES"
+      echo "-------------------------------------"
+
+      SENSITIVE=false
+
+      while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        BASENAME=$(basename "$file")
+
+        if [ "$BASENAME" = "values.yml" ]; then
+          SENSITIVE=true
+          break
+        fi
+
+        case "$BASENAME" in
+          *-prod.yml)
+            SENSITIVE=true
+            break
+            ;;
+        esac
+      done <<< "$CHANGED_FILES"
+
+      if [ "$SENSITIVE" = "false" ]; then
+        echo "No sensitive files in this merge. Skipping tag."
+        exit 0
+      fi
+
+      TAG_NAME="release-$(date -u +%Y%m%d-%H%M%S)"
+
+      echo "=== Sensitive files detected — creating post-merge tag ==="
+      echo "Tag:    $TAG_NAME"
+      echo "Commit: $CI_COMMIT_SHA"
+      echo "Author: $CI_COMMIT_AUTHOR"
+
+      HTTP_STATUS=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+        --request POST \
+        --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "{
+          \"tag_name\": \"$TAG_NAME\",
+          \"ref\": \"$CI_COMMIT_SHA\",
+          \"message\": \"Auto-tagged after merge to main\nCommit: $CI_COMMIT_SHA\nAuthor: $CI_COMMIT_AUTHOR\"
+        }" \
+        "$GITLAB_URL/api/v4/projects/$CI_PROJECT_ID/repository/tags")
+
+      echo "API response status: $HTTP_STATUS"
+
+      if [ "$HTTP_STATUS" = "201" ]; then
+        echo "Tag $TAG_NAME created successfully."
+      else
+        echo "ERROR: Tag creation failed with HTTP $HTTP_STATUS"
+        exit 1
+      fi
